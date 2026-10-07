@@ -1,0 +1,37 @@
+name: StableKite WinRT 3.2.1 CPython 3.14t compile
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/build-stablekite-cp314t.py
+      - .github/workflows/stablekite-cp314t.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout coherent WinRT 3.2.1 sources
+        uses: actions/checkout@v4
+        with:
+          repository: StableKite/pywinrt
+          ref: 93d9abe237ca5ced10a839f4aa9bee29b40929b3
+          path: release-source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install wheel builder
+        run: python -m pip install 'cibuildwheel[uv]==3.2.1' 'wheel==0.45.1'
+      - name: Compile nine CPython 3.14t x86-64 packages
+        run: python scripts/build-stablekite-cp314t.py --source-root release-source
+      - name: Upload compile results
+        uses: actions/upload-artifact@v4
+        with:
+          name: stablekite-winrt-3.2.1-cp314t-win_amd64
+          if-no-files-found: error
+          path: wheelhouse/stablekite-cp314t/
