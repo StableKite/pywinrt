@@ -34,12 +34,12 @@ VERSION = "3.2.1"
 TAG = "cp314-cp314t-win_amd64"
 
 
-def require(condition, message):
+def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
 
 
-def check_interpreter():
+def check_interpreter() -> None:
     require(os.name == "nt", "Windows is required")
     require(platform.python_implementation() == "CPython", "CPython is required")
     require(sys.version_info[:2] == (3, 14), "CPython 3.14 is required")
@@ -54,13 +54,13 @@ def check_interpreter():
         "/DPy_GIL_DISABLED=1" in os.environ.get("CL", "").split(),
         "MSVC free-threaded macro is missing",
     )
-    packages = {}
+    packages: dict[str, str] = {}
     for name in ("pip", "setuptools", "wheel", "build", "uv"):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             pass
-    receipt = {
+    receipt: dict[str, object] = {
         "implementation": sys.implementation.name,
         "version": sys.version,
         "version_info": list(sys.version_info[:3]),
@@ -77,7 +77,7 @@ def check_interpreter():
     print("STABLEKITE_BUILD_INTERPRETER:" + json.dumps(receipt), flush=True)
 
 
-def verify_wheel(path, package):
+def verify_wheel(path: Path, package: str) -> dict[str, str | int]:
     require(
         path.name.endswith("-" + TAG + ".whl"), "Unexpected wheel tag: " + path.name
     )
@@ -88,7 +88,10 @@ def verify_wheel(path, package):
         wheel_info = [name for name in names if name.endswith(".dist-info/WHEEL")]
         require(len(metadata) == len(wheel_info) == 1, "Ambiguous wheel metadata")
         info = BytesParser().parsebytes(archive.read(metadata[0]))
-        normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+
+        def normalize(name: str) -> str:
+            return re.sub(r"[-_.]+", "-", name).lower()
+
         require(
             normalize(info["Name"]) == normalize(package), "Wrong wheel distribution"
         )
@@ -108,7 +111,7 @@ def verify_wheel(path, package):
     }
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-root",
@@ -155,7 +158,7 @@ def main():
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     selected = tuple(dict.fromkeys(args.package or PACKAGES))
-    results = []
+    results: list[dict[str, str | int]] = []
     for package in selected:
         relative = (
             "projection/winrt-runtime"
