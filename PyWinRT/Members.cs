@@ -44,7 +44,10 @@ sealed class Members
     /// Initializes a new instance of the <see cref="Members"/> class.
     /// </summary>
     /// <param name="typeDefinitions">Type definitions to categorize.</param>
-    public Members(IEnumerable<TypeDefinition> typeDefinitions)
+    /// <param name="legacyMethodAliases">
+    /// Whether methods get a deprecated alias under their pywinrt v3.x name.
+    /// </param>
+    public Members(IEnumerable<TypeDefinition> typeDefinitions, bool legacyMethodAliases)
     {
         var enums = new List<TypeDefinition>();
         var structs = new List<TypeDefinition>();
@@ -95,13 +98,31 @@ sealed class Members
             }
         }
 
-        Enums = enums.Select(e => new ProjectedType(e)).ToArray();
-        Structs = structs.Select(s => new ProjectedType(s)).ToArray();
-        Interfaces = interfaces.Select(i => new ProjectedType(i)).ToArray();
-        Classes = classes.Select(c => new ProjectedType(c)).ToArray();
-        Delegates = delegates.Select(d => new ProjectedType(d)).ToArray();
-        Attributes = attributes.Select(a => new ProjectedType(a)).ToArray();
-        Contracts = contracts.Select(c => new ProjectedType(c)).ToArray();
+        Enums = Project(enums, legacyMethodAliases);
+        Structs = Project(structs, legacyMethodAliases);
+        Interfaces = Project(interfaces, legacyMethodAliases);
+        Classes = Project(classes, legacyMethodAliases);
+        Delegates = Project(delegates, legacyMethodAliases);
+        Attributes = Project(attributes, legacyMethodAliases);
+        Contracts = Project(contracts, legacyMethodAliases);
+    }
+
+    private static ProjectedType[] Project(List<TypeDefinition> types, bool legacyMethodAliases)
+    {
+        // Analyzing a type is relatively expensive and independent of other
+        // types, so for large namespaces, do it in parallel. This helps the
+        // largest namespaces, which would otherwise be the last ones still
+        // running at the end.
+        if (types.Count < 32)
+        {
+            return types.Select(t => new ProjectedType(t, legacyMethodAliases)).ToArray();
+        }
+
+        return types
+            .AsParallel()
+            .AsOrdered()
+            .Select(t => new ProjectedType(t, legacyMethodAliases))
+            .ToArray();
     }
 
     private static IEnumerable<TypeReference> RecursiveGetTypes(TypeReference type)
@@ -138,13 +159,67 @@ sealed class Members
             }
         }
 
+        // A struct field of a struct is resolved when the struct's type is
+        // built, which imports the package that defines it. A struct only
+        // referenced through a generic, such as IReference<T>, is resolved on
+        // first use instead.
+        foreach (var s in Structs)
+        {
+            foreach (var fieldType in s.Type.Fields.Select(f => f.FieldType))
+            {
+                if (
+                    fieldType.Namespace != s.Namespace
+                    && fieldType.Namespace != "System"
+                    && IsNestedStruct(fieldType)
+                )
+                {
+                    namespaces.Add(fieldType.GetQualifiedNamespace(packageMap));
+                }
+            }
+        }
+
         return namespaces;
     }
+
+    /// <summary>
+    /// Indicates that a field of type <paramref name="type"/> holds a struct
+    /// the runtime resolves to its own type, rather than one it stores as a
+    /// value of its own, like DateTime or HResult.
+    /// </summary>
+    private static bool IsNestedStruct(TypeReference type) =>
+        type.FullName
+            is not (
+                "Windows.Foundation.DateTime"
+                or "Windows.Foundation.TimeSpan"
+                or "Windows.Foundation.HResult"
+                or "Windows.Foundation.EventRegistrationToken"
+            )
+        && type.TryResolve()?.GetCategory() == Category.Struct;
+
+    private readonly IReadOnlyCollection<QualifiedNamespace>?[] referencedNamespacesCache =
+        new IReadOnlyCollection<QualifiedNamespace>?[4];
 
     public IReadOnlyCollection<QualifiedNamespace> GetReferencedNamespaces(
         IReadOnlyDictionary<string, string> packageMap,
         bool includeDelegates = false,
         bool includeInheritedInterfaces = false
+    )
+    {
+        // This is called several times per namespace with the same arguments
+        // (once for each generated file), so the result is cached.
+        var cacheIndex = (includeDelegates ? 1 : 0) | (includeInheritedInterfaces ? 2 : 0);
+
+        return referencedNamespacesCache[cacheIndex] ??= ComputeReferencedNamespaces(
+            packageMap,
+            includeDelegates,
+            includeInheritedInterfaces
+        );
+    }
+
+    private IReadOnlyCollection<QualifiedNamespace> ComputeReferencedNamespaces(
+        IReadOnlyDictionary<string, string> packageMap,
+        bool includeDelegates,
+        bool includeInheritedInterfaces
     )
     {
         var namespaces = new SortedSet<QualifiedNamespace>();
@@ -183,40 +258,9 @@ sealed class Members
                 }
             }
 
-            foreach (
-                var method in type
-                    .Constructors.Select(c => c.Method)
-                    .Concat(type.Methods.Select(m => m.Method))
-                    .Concat(
-                        type.Properties.SelectMany(p =>
-                            (IEnumerable<MethodDefinition>)(
-                                p.Property.SetMethod is null
-                                    ? [p.Property.GetMethod]
-                                    : [p.Property.GetMethod, p.Property.SetMethod]
-                            )
-                        )
-                    )
-                    .Concat(
-                        type.Events.SelectMany(e =>
-                            (IEnumerable<MethodDefinition>)[e.Event.AddMethod, e.Event.RemoveMethod]
-                        )
-                    )
-            )
+            foreach (var t in GetForeignSignatureTypes(type))
             {
-                foreach (
-                    var t in method
-                        .Parameters.Select(p => p.ParameterType)
-                        .Append(method.ReturnType)
-                        .SelectMany(RecursiveGetTypes)
-                        .Where(t =>
-                            !string.IsNullOrEmpty(t.Namespace)
-                            && t.Namespace != "System"
-                            && t.Namespace != type.Namespace
-                        )
-                )
-                {
-                    namespaces.Add(t.GetQualifiedNamespace(packageMap));
-                }
+                namespaces.Add(t.GetQualifiedNamespace(packageMap));
             }
         }
 
@@ -242,5 +286,47 @@ sealed class Members
         }
 
         return namespaces;
+    }
+
+    /// <summary>
+    /// Gets every type from another namespace that appears in a member
+    /// signature (constructor, method, property or event) of <paramref name="type"/>,
+    /// including the arguments of generic instances.
+    /// </summary>
+    private static IEnumerable<TypeReference> GetForeignSignatureTypes(ProjectedType type)
+    {
+        return GetMemberMethods(type)
+            .SelectMany(m => m.Parameters.Select(p => p.ParameterType).Append(m.ReturnType))
+            .SelectMany(RecursiveGetTypes)
+            .Where(t =>
+                !string.IsNullOrEmpty(t.Namespace)
+                && t.Namespace != "System"
+                && t.Namespace != type.Namespace
+            );
+    }
+
+    /// <summary>
+    /// Gets the methods behind every member (constructor, method, property or
+    /// event) of <paramref name="type"/> that the generated code calls.
+    /// </summary>
+    private static IEnumerable<MethodDefinition> GetMemberMethods(ProjectedType type)
+    {
+        return type
+            .Constructors.Select(c => c.Method)
+            .Concat(type.Methods.Select(m => m.Method))
+            .Concat(
+                type.Properties.SelectMany(p =>
+                    (IEnumerable<MethodDefinition>)(
+                        p.SetMethod is null
+                            ? [p.GetMethod.Method]
+                            : [p.GetMethod.Method, p.SetMethod.Method]
+                    )
+                )
+            )
+            .Concat(
+                type.Events.SelectMany(e =>
+                    (IEnumerable<MethodDefinition>)[e.Event.AddMethod, e.Event.RemoveMethod]
+                )
+            );
     }
 }
