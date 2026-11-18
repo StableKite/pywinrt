@@ -8,6 +8,11 @@ package runs on.
 The releases before v4.0 are in the [changelog at the root of the
 repository](../CHANGELOG.md).
 
+## [4.0.3+stablekite.1] - 2026-11-18
+
+### Fixed
+- Release cached WinRT activation factories before uninitializing an apartment.
+
 ## [4.0.3] - 2026-10-24
 
 ### Fixed
